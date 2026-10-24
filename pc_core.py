@@ -585,9 +585,19 @@ def build_entry_for_dir(d: str, parent_id: str, taken_ids: set[str]) -> tuple[di
     return e, "纯代码仓"
 
 
+def _has_project_marker(d: str) -> bool:
+    """目录里直接放着 pom.xml / package.json → 这个目录本身就是个独立项目。"""
+    return (os.path.isfile(os.path.join(d, "pom.xml"))
+            or os.path.isfile(os.path.join(d, "package.json")))
+
+
 def scan_code_dir(root: str | None = None) -> tuple[list[dict], list[dict]]:
     """扫描工作根目录,返回 (新增条目列表, 磁盘已缺失的注册表条目列表)。
 
+    目录结构**逐目录自适应**,两种布局(含混合)都能扫对,且一个项目只出一条记录:
+      · 一级子目录自身带 pom.xml / package.json → 它直接就是项目,生成单条目,
+        不再往下扫(避免把 src/config/public 这类子目录误当成项目);
+      · 否则视为「分组仓」,往下扫一级,二级子目录才是项目(老布局)。
     已存在条目按 dir 路径精确匹配,完全不动(备注/端口修正都保留)。
     root 缺省时取 cfg_work_root()(配置顶层 work_root > 环境变量 > ~/code)。
     """
@@ -597,12 +607,26 @@ def scan_code_dir(root: str | None = None) -> tuple[list[dict], list[dict]]:
     taken_ids = {e["id"] for e in existing}
     known_dirs = {(e.get("dir") or "").rstrip("/") for e in existing}
 
+    def _subdirs(d: str) -> list[str]:
+        return [x for x in sorted(os.listdir(d))
+                if not x.startswith(".") and x not in _SKIP_DIRS
+                and os.path.isdir(os.path.join(d, x))]
+
     new_entries: list[dict] = []
-    for lvl1 in sorted(os.listdir(root)):
+    for lvl1 in _subdirs(root):
         gdir = os.path.join(root, lvl1)
-        if not os.path.isdir(gdir) or lvl1.startswith(".") or lvl1 in _SKIP_DIRS:
+
+        # 布局自适应:一级目录自己就是项目 → 单条目,不往下扫
+        if _has_project_marker(gdir):
+            if gdir.rstrip("/") in known_dirs:
+                continue                     # 已受管,完全不动
+            e, _type = build_entry_for_dir(gdir, "", taken_ids)
+            e.pop("parent", None)            # 顶级项目没有父节点
+            new_entries.append(e)
+            known_dirs.add(gdir.rstrip("/"))
             continue
-        # 一级仓节点不存在就自动建
+
+        # 分组仓(两级布局):一级节点不存在就自动建,二级才是项目
         repo_e = None
         if gdir.rstrip("/") not in known_dirs:
             rid = _unique_id(lvl1.lower(), taken_ids)
@@ -613,10 +637,8 @@ def scan_code_dir(root: str | None = None) -> tuple[list[dict], list[dict]]:
         else:
             repo_e = next((e for e in existing
                            if (e.get("dir") or "").rstrip("/") == gdir.rstrip("/")), None)
-        for lvl2 in sorted(os.listdir(gdir)):
+        for lvl2 in _subdirs(gdir):
             pdir = os.path.join(gdir, lvl2)
-            if not os.path.isdir(pdir) or lvl2.startswith(".") or lvl2 in _SKIP_DIRS:
-                continue
             if pdir.rstrip("/") in known_dirs:
                 continue                     # 已受管,完全不动
             e, _type = build_entry_for_dir(pdir, repo_e["id"], taken_ids)
@@ -711,6 +733,29 @@ def port_pids(port: int) -> list[str]:
     if code != 0 or not out.strip():
         return []
     return [x for x in out.split() if x.strip()]
+
+
+def port_owner_cwds(port: int) -> dict[str, str]:
+    """端口监听进程的 {pid: 工作目录 cwd}(读不到 cwd 的进程跳过)。
+
+    用于「端口归属」判定:两个项目共用一个端口时,lsof 只知道「端口有人听」,
+    不知道是谁听的 —— 用监听进程的 cwd 落在哪个项目目录来判断归属,
+    否则 A 项目起了,B 项目也跟着亮假绿灯。
+    注意 macOS 的 /tmp 是 /private/tmp 的软链,统一 realpath 归一化后再比。
+    """
+    out: dict[str, str] = {}
+    for pid in port_pids(port):
+        try:
+            r = subprocess.run(
+                ["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+                capture_output=True, text=True, timeout=6)
+            for line in r.stdout.splitlines():
+                if line.startswith("n/"):
+                    out[pid] = os.path.realpath(line[1:].strip())
+                    break
+        except Exception:  # noqa: BLE001 — 单个进程读失败不影响整体
+            pass
+    return out
 
 
 def proc_info(pids: list[str]) -> str:

@@ -46,7 +46,7 @@ from pc_core import (  # noqa: F401
     base_dir, check_registry, check_target, config_path, cfg_work_root,
     deploy_fmt_size, deploy_static, deploy_validate, env_report, guess_pkg,
     health_ok, load_config, load_scripts, load_targets, new_target_id, notify,
-    port_listening, port_pids, proc_info, safe_name, save_config, save_targets,
+    port_listening, port_owner_cwds, port_pids, proc_info, safe_name, save_config, save_targets,
     scan_code_dir, sh, svc_active,
     env_job_item, env_last_text, env_name, git_remote_short, migrate_envs,
     ssh_error_hint,
@@ -502,6 +502,7 @@ class App(LogPanelMixin, EnvPanelMixin, ServersMixin, tk.Tk):
         menu.add_command(label="■ 停止全部", command=self.stop_work_group)
         menu.add_command(label="⤵ 同步项目目录", command=self.sync_code_dir)
         menu.add_command(label="📂 更改项目目录…", command=self.change_work_root)
+        menu.add_command(label="🧹 清空并重新导入…", command=self.reset_and_rescan)
         if self.theme is THEMES["dark"]:
             menu.add_command(label="☀️ 切换浅色", command=self.toggle_theme)
         else:
@@ -1476,6 +1477,28 @@ class App(LogPanelMixin, EnvPanelMixin, ServersMixin, tk.Tk):
                 f"项目根目录已改为:\n{chosen}\n\n是否立即扫描并导入该目录下的项目?"):
             self.sync_code_dir()
 
+    def reset_and_rescan(self):
+        """清空全部受管条目 → 立即重新扫描导入(服务器清单与项目目录保留)。
+
+        适合「扫描规则升级后想重来一遍」或注册表被扫乱了的场景:
+        先确认 → 条目清空落盘 → 走既有的同步扫描流程,弹确认框后重新纳管。
+        """
+        if not messagebox.askyesno(
+                "清空并重新导入",
+                "将清空全部受管条目(服务器清单与项目根目录保留),\n"
+                "然后立即按当前项目根目录重新扫描导入。\n\n确定继续?"):
+            return
+        cfg = load_config()
+        cfg["entries"] = []
+        save_config(cfg)
+        self.cfg = cfg
+        self.entries = cfg["entries"]
+        self.status.clear()
+        self.sel_id = None
+        self._reload_list()
+        self.log("🧹 已清空全部受管条目,开始重新扫描 …")
+        self.sync_code_dir()
+
     def _show_sync_dialog(self, new: list[dict], missing: list[dict]):
         """同步结果确认框:新项目预览 + 缺失条目逐个勾选是否删除。"""
         if not new and not missing:
@@ -1527,6 +1550,8 @@ class App(LogPanelMixin, EnvPanelMixin, ServersMixin, tk.Tk):
             cfg["entries"].extend(new)
             save_config(cfg)
             self.entries = cfg["entries"]
+            for e in new:
+                self._ensure_status(e)   # 新条目补建状态缓存,否则红绿灯拿不到数据
             # 清掉已删条目的状态缓存
             live_ids = {x["id"] for x in self.entries}
             for eid in [i for i in self.status if i not in live_ids]:
@@ -1670,6 +1695,18 @@ class App(LogPanelMixin, EnvPanelMixin, ServersMixin, tk.Tk):
         save_config(cfg)
         self._apply_new_config(cfg, "✅ 已载入示例配置;双击条目编辑,或直接修改 projects.json")
 
+    def _ensure_status(self, e: dict):
+        """状态缓存缺失时按条目配置补建(同步/清空重导入后的新条目)。
+
+        不补建的话,端口检查结果回来时 `if eid in self.status` 会把数据
+        整个丢掉 → 新条目左栏红绿灯永远红(实测踩到)。
+        """
+        if e.get("id") and e["id"] not in self.status:
+            self.status[e["id"]] = {
+                "ports": {p["port"]: None for p in (e.get("local") or {}).get("ports", [])},
+                "svc": None, "svc_detail": "", "health": None, "extra_svc": {}, "pids": [],
+            }
+
     def _apply_new_config(self, cfg: dict, note: str):
         """引导完成后应用新配置:刷新内存状态、重建左栏与状态缓存。"""
         self.cfg = cfg
@@ -1713,6 +1750,9 @@ class App(LogPanelMixin, EnvPanelMixin, ServersMixin, tk.Tk):
 
         detail=True 时附带占用进程信息(P2-3,不进 15s 轮询以免高频 ps)。
         - 端口就绪 → 移出 starting;
+        - **端口归属**:监听进程的 cwd 必须落在本项目目录里才算本项目在跑
+          (两个项目共用一个端口时,A 起了不会让 B 亮假绿灯);被外来进程
+          占用时本项目红灯,PID 也不收进缓存(停止时不会误杀别人的进程);
         - 超时(默认 90s,条目可用 start_timeout 覆盖)仍未就绪 → 移出 starting
           并告警假绿灯(P0-1);
         - PID 随消息回主线程写入缓存(P2-1),供按 PID 精确停止使用;
@@ -1722,15 +1762,30 @@ class App(LogPanelMixin, EnvPanelMixin, ServersMixin, tk.Tk):
         ports = loc.get("ports", [])
         results = []
         all_pids: list[str] = []
+        # 端口归属判定:条目目录(realpath 归一化,macOS /tmp → /private/tmp)
+        e_dir = os.path.realpath(os.path.expanduser(e.get("dir") or "")).rstrip("/") or None
         for p in ports:
-            pids = port_pids(p["port"])
-            ok = bool(pids)
-            procline = proc_info(pids) if (detail and pids) else ""
+            raw_pids = port_pids(p["port"])
+            mine_pids, foreign_hint = raw_pids, ""
+            if raw_pids and e_dir:
+                owners = port_owner_cwds(p["port"])
+                if owners:
+                    # 只有 cwd 落在本项目目录(或其子目录)里的进程才算本项目启动的。
+                    # 否则 A 项目先起了,B 项目(同端口)也会亮假绿灯。
+                    mine_pids = [pid for pid in raw_pids
+                                 if owners.get(pid, "").rstrip("/") == e_dir
+                                 or owners.get(pid, "").startswith(e_dir + "/")]
+                    if not mine_pids:
+                        foreign_hint = " ⚠️ 端口被其他进程占用(不是本项目启动的,不计入本项目状态)"
+            ok = bool(mine_pids)
+            procline = proc_info(raw_pids) if (detail and raw_pids) else ""
+            if foreign_hint:
+                procline = (procline + foreign_hint).strip()
             results.append((p, ok))
-            for pid in pids:                       # 所有端口的并集(去重保序)
-                if pid not in all_pids:
+            for pid in mine_pids:                  # 只收自己进程的 PID 并集(去重保序)
+                if pid not in all_pids:            # —— 停止本项目时不能误杀占用同端口的外来进程
                     all_pids.append(pid)
-            self.q.put(("port", e["id"], p["port"], ok, pids, procline))
+            self.q.put(("port", e["id"], p["port"], ok, mine_pids, procline))
         # P2-1:PID 缓存必须是**并集**,且在本轮所有 port 消息之后写入。
         # 早期实现在 port 分支里逐个覆盖 st["pids"],结果只剩最后一个端口的进程
         # —— 多端口条目(如 note 的 3100+5173)点停止只杀掉前端,后端留在后台。
@@ -2320,6 +2375,8 @@ class App(LogPanelMixin, EnvPanelMixin, ServersMixin, tk.Tk):
             # v2.0 修复:此前这里只更新标签不写缓存,导致工作组条目
             # 端口起来后 self.status["ports"] 仍是初始值 None,
             # _overall_dot 读到全 None → 启动成功后灯反而变红。
+            if e is not None:
+                self._ensure_status(e)   # 同步/清空重导入后的新条目兜底补建
             if eid in self.status:
                 st = self.status[eid]
                 old = st["ports"].get(port)
