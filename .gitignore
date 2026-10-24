@@ -1,0 +1,17 @@
+# macOS
+.DS_Store
+
+# 本机配置(注册表与密钥绝不进仓库)
+projects.json
+projects.json.bak
+projects.json.bad
+secrets.json
+secrets.json.bak
+
+# 构建产物与缓存
+build/
+dist/
+__pycache__/
+*.pyc
+.venv-desktop/
+.pyi-cache/
