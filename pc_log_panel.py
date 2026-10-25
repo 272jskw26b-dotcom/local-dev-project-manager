@@ -347,7 +347,7 @@ class LogPanelMixin:
         if not os.path.isdir(cwd):
             cwd = os.path.expanduser("~")
         try:
-            sess = pc_core.pty_spawn(cwd, e.get("node_version"))
+            sess = pc_core.pty_spawn(cwd, pc_core.resolve_node_version(e))
         except Exception as ex:  # noqa: BLE001  起不来也不能把 UI 拖崩
             info["term"] = None
             self._tab_write(tid, f"❌ 内置 shell 启动失败: {ex}\n")
@@ -494,7 +494,7 @@ class LogPanelMixin:
         if eid:
             self.log(text)
         threading.Thread(
-            target=lambda: notify("Project Console", text.lstrip("⚠️ ").strip()),
+            target=lambda: notify("项目管理工具", text.lstrip("⚠️ ").strip()),
             daemon=True).start()
 
     def _tab_write(self, tid: str, s: str):
@@ -517,10 +517,16 @@ class LogPanelMixin:
             pass
 
     def _logtab_for(self, eid: str) -> str:
-        """确保某条目有日志 tab,返回 tab id(条目不存在则退回系统 tab)。"""
+        """确保某条目有日志 tab,返回 tab id(条目不存在则退回系统 tab)。
+
+        **目录节点(repo)一律不建 tab** —— 目录只是分组导航,没有自己的
+        运行输出,给它建 tab 只会让底部 tab 条越堆越多(选中目录时状态
+        检查会写一条带目录 eid 的日志,之前就被这个动作创建出了目录 tab)。
+        """
         if eid in self._logtabs:
             return eid
-        if not self._entry(eid):
+        e = self._entry(eid)
+        if not e or e.get("kind") == "repo":
             return SYSTEM_TAB
         self._logtab_add(eid, closable=True)
         return eid

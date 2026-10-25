@@ -1,6 +1,6 @@
-# Project Console
+# 项目管理工具
 
-macOS 原生(Python + Tkinter)桌面「本地项目控制台」:把散落在各处的本地项目
+macOS 原生(Python + Tkinter)桌面「本地项目管理工具」:把散落在各处的本地项目
 启停命令、端口占用、日志、远程服务器 systemd 服务和前端静态发布,收进一个
 双击即用的 App。
 
@@ -48,7 +48,7 @@ PC_PYTHON=/opt/homebrew/bin/python3.13 ./build.sh
 ### 方式二:下载 Release
 
 从 [Releases](https://github.com/272jskw26b-dotcom/local-dev-project-manager/releases)
-下载 `Project Console.app`,拖到「应用程序」或桌面双击即可。
+下载 `项目管理工具.app`,拖到「应用程序」或桌面双击即可。
 
 ## 首次启动
 
@@ -74,9 +74,9 @@ PC_PYTHON=/opt/homebrew/bin/python3.13 ./build.sh
 
 ```
 ~/code/                      ← 项目根目录(work_root)
-├── hzgj/                    ← 没有特征文件 → 视为「分组仓」
-│   ├── ai-platform-api/     ← 有 pom.xml → Java 项目,一条记录
-│   └── ai-platform-web/     ← 有 package.json → Node 项目,一条记录
+├── backend/                 ← 没有特征文件 → 视为「分组仓」
+│   ├── order-service/       ← 有 pom.xml → Java 项目,一条记录
+│   └── web-frontend/        ← 有 package.json → Node 项目,一条记录
 ├── my-standalone-app/       ← 一级目录自己带 package.json → 直接就是项目,
 │                               一条记录,不会再往下扫 src/config 等
 └── tools/                   ← 没有特征文件 → 分组仓,继续扫它的子目录

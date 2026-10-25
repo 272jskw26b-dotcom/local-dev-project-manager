@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Project Console —— 本机项目控制台(入口 + App 核心逻辑)
+项目管理工具 —— 本地项目管理工具(入口 + App 核心逻辑)
 
 统一查看/启动/停止本地项目环境,以及远程服务器上的 systemd 服务。
 受管条目全部声明在旁路 projects.json,新增项目不改代码。
@@ -33,6 +33,7 @@ import glob
 import json
 import os
 import queue
+import shlex
 import threading
 import time
 import tkinter as tk
@@ -58,7 +59,7 @@ from pc_core import (  # noqa: F401
     pty_write, strip_ansi,
     # v3.0 密钥外置 + 发布前 Git 检查:冒烟脚本要用,同样 re-export。
     deploy_git_check, ensure_env_ids, git_state, load_secrets, save_secrets,
-    secrets_path,
+    resolve_node_version, secrets_path,
 )
 # 常量经本文件再导出一层:`pc.GROUPS` / `pc.SYSTEM_TAB` 等旧写法不能断。
 from pc_const import (  # noqa: F401
@@ -134,6 +135,7 @@ class App(LogPanelMixin, EnvPanelMixin, ServersMixin, tk.Tk):
         # 状态消息命中 AttributeError 并中断整个轮询循环(v2.0 修复)。
         self._dot_labels: dict[str, dict] = {}
         self._proc_labels: dict[str, dict] = {}
+        self._branch_labels: dict[str, tk.Label] = {}   # 详情头部分支胶囊(刷新本项目时更新)
         self.q: queue.Queue = queue.Queue()
         self.sel_id: str | None = None
         self.scripts: dict[str, list] = {}   # eid -> [(script名, 命令)]
@@ -483,17 +485,16 @@ class App(LogPanelMixin, EnvPanelMixin, ServersMixin, tk.Tk):
                  font=("PingFang SC", 17, "bold")).pack(side="left", padx=(2, 0))
         tk.Label(self._top, text="本地环境 + 服务器服务 统一管理", bg=self._c("bg"),
                  fg=self._c("mut"), font=("PingFang SC", 11)).pack(side="left", padx=(10, 0), pady=(3, 0))
-        # 右侧按钮:视觉顺序(从左到右)= ↻刷新 → ⚙服务器 → 读取脚本 → 更多⋯
+        # 右侧按钮:视觉顺序(从左到右)= ⚙服务器 → 读取脚本 → 更多⋯
+        # (全局刷新已去掉:状态有 15s 自动轮询,手动刷新在右侧详情头部「↻ 刷新本项目」)
         #
         # 注意 pack 顺序:side="right" 是「先 pack 的贴最右」,所以要得到
-        # 上面的视觉顺序,必须**倒着 pack**(更多⋯ 最先 → 刷新最后)。
-        # 刷新是最高频操作,放最左;「更多⋯」收纳低频动作,贴最右。
+        # 上面的视觉顺序,必须**倒着 pack**(更多⋯ 最先 → 服务器最后)。
         self._more_btn = self._btn(self._top, "更多 ⋯", self._popup_more_menu)
         self._more_btn.pack(side="right", padx=(6, 0))
         self._btn(self._top, "读取脚本", self.refresh_scripts).pack(side="right", padx=(6, 0))
         self._btn(self._top, "⚙ 服务器",
                   lambda: self._servers_dialog()).pack(side="right", padx=(6, 0))
-        self._btn(self._top, "↻ 刷新", self.refresh_selected).pack(side="right", padx=(6, 0))
 
     def _popup_more_menu(self):
         """「更多」下拉菜单:收纳体检/停止全部/同步项目目录/切换主题。"""
@@ -634,6 +635,12 @@ class App(LogPanelMixin, EnvPanelMixin, ServersMixin, tk.Tk):
                 flush()          # Cmd+W / 红叉直接关窗也不能丢正在编辑的环境
             except Exception:  # noqa: BLE001
                 pass
+        nflush, self._note_flush = getattr(self, "_note_flush", None), None
+        if callable(nflush):
+            try:
+                nflush()         # 备注框同理:直接关窗也别丢没失焦的输入
+            except Exception:  # noqa: BLE001
+                pass
         self._cancel_env_debounce()
         try:
             self._term_stop_all()
@@ -733,6 +740,12 @@ class App(LogPanelMixin, EnvPanelMixin, ServersMixin, tk.Tk):
                 flush()
             except Exception:  # noqa: BLE001 — 保存失败不能挡住渲染
                 pass
+        nflush, self._note_flush = getattr(self, "_note_flush", None), None
+        if callable(nflush):
+            try:
+                nflush()         # 备注框:切项目前把未失焦的输入落盘
+            except Exception:  # noqa: BLE001 — 保存失败不能挡住渲染
+                pass
         self._cancel_env_debounce()
         self.sel_id = entry_id
         self._reload_list()
@@ -746,9 +759,12 @@ class App(LogPanelMixin, EnvPanelMixin, ServersMixin, tk.Tk):
         self._render_detail(e)
         if e.get("log_file"):
             self._attach_tail(e["log_file"], e["id"])   # 选中即回显该项目的运行日志
-        # 日志 tab:已有该项目 tab 就自动切过去,没有就停在「系统」tab
-        # (不主动新建 —— 否则每点一次左栏就多一个空 shell)
-        self._logtab_show(e["id"] if e["id"] in self._logtabs else SYSTEM_TAB)
+        # 日志 tab:选中**项目** → 切到该项目的控制台(没有就自动建一个,
+        # 每个项目一个自己的 tab,之前只切已存在的 tab、没建过就停在系统
+        # tab,用户觉得"没切过去");选中**目录**(repo)→ 不动控制台 ——
+        # 目录只是分组导航,不该打开/切换它的控制台信息(用户要求)。
+        if e.get("kind") != "repo":
+            self._logtab_show(self._logtab_for(e["id"]))
         self.refresh_selected()
 
     def _entry(self, eid) -> dict | None:
@@ -1049,6 +1065,7 @@ class App(LogPanelMixin, EnvPanelMixin, ServersMixin, tk.Tk):
     def _render_detail(self, e: dict):
         self._dot_labels: dict[str, dict] = {e["id"]: {}}
         self._proc_labels: dict[str, dict] = {e["id"]: {}}   # 端口占用者说明(P2-3)
+        self._branch_labels: dict[str, tk.Label] = {}   # 头部分支胶囊引用(重渲染即重置)
         self._status_chips: dict = {}   # 顶部状态胶囊(键: port/svc/health)
         if e["id"] not in self.scripts:
             self.scripts[e["id"]] = load_scripts(e)   # 懒加载,渲染即读盘
@@ -1059,6 +1076,11 @@ class App(LogPanelMixin, EnvPanelMixin, ServersMixin, tk.Tk):
         head.pack(fill="x", padx=16, pady=(14, 0))
         tk.Label(head, text=self.disp(e), bg=self._c("card"), fg=self._c("fg"),
                  font=("PingFang SC", 15, "bold")).pack(side="left")
+        # 单个项目的刷新按钮:只查这个项目的端口 + 服务器状态
+        # (顶部的「↻ 检查全部」才是查所有项目)。
+        self._ghost_btn(head, "↻ 刷新本项目",
+                        lambda: self.refresh_selected(),
+                        height=24, font_size=11).pack(side="right", pady=(2, 0))
 
         # 当前 Git 分支 + 远程地址(第二行;右键可备注 / 复制)
         meta = tk.Frame(self.dinner, bg=self._c("card"))
@@ -1069,7 +1091,9 @@ class App(LogPanelMixin, EnvPanelMixin, ServersMixin, tk.Tk):
             branch = out.strip() if code == 0 else ""
             if branch:
                 br_remark = (e.get("branch_remarks") or {}).get(branch, "")
-                # 分支做成小胶囊:一眼能和后面的地址区分开
+                # 分支做成小胶囊:一眼能和后面的地址区分开。
+                # 单击 = 弹分支切换菜单(列出本地分支,点即 git checkout);
+                # 右键 = 复制 / 备注当前分支(见 _branch_context_menu)。
                 blab = tk.Label(
                     meta, cursor="hand2", bg=self._c("card_hi"),
                     fg=self._c("fg"),
@@ -1078,7 +1102,9 @@ class App(LogPanelMixin, EnvPanelMixin, ServersMixin, tk.Tk):
                 blab.pack(side="left")
                 for seq in ("<Button-2>", "<Button-3>", "<Control-Button-1>"):
                     blab.bind(seq, lambda ev, br=branch: self._branch_context_menu(e, br, ev))
-                blab.bind("<Button-1>", lambda _ev: self.select(e["id"]))  # 单击刷新分支
+                blab.bind("<Button-1>",
+                          lambda _ev, br=branch: self._branch_dialog(e, br))
+                self._branch_labels[e["id"]] = blab   # 「刷新本项目」要更新它
 
             # Git 远程地址:v2.7.3 起只留 `@` 之后那段,紧跟分支显示(不再单独占一行)
             code2, out2 = sh(f"git -C '{e['dir']}' remote get-url origin 2>&1", timeout=10)
@@ -1120,7 +1146,12 @@ class App(LogPanelMixin, EnvPanelMixin, ServersMixin, tk.Tk):
         self._render_actions_row(e, scripts)
 
         # —— 环境区:本机环境(左 1 份)+ 运行环境(右 2 份)两列
-        self._render_env_pair(e)
+        # 目录节点(repo)不渲染 —— 目录只是分组,没有运行环境可言(用户要求)
+        if e.get("kind") != "repo":
+            self._render_env_pair(e)
+
+        # —— 目录备注:目录节点(一级分组仓)在右侧留一块多行备注
+        self._render_note(e)
 
         # 顶部胶囊先按缓存里的旧状态画一版,等后台检查回填后再刷新
         self._refresh_status_chips(e["id"])
@@ -1436,12 +1467,7 @@ class App(LogPanelMixin, EnvPanelMixin, ServersMixin, tk.Tk):
         self.bg(lambda: self._check_local(e, detail=True))   # 选中/手动:带占用进程信息
         if e.get("server"):
             self.bg(lambda: self._check_server(e))
-        self._reload_list()
-
-    def refresh_all_local(self):
-        self.log("手动刷新:全部条目本地端口")
-        for e in self.entries:
-            self.bg(lambda ent=e: self._check_local(ent, detail=True))
+        self._refresh_branch_label(e)   # 刷新本项目时重新获取当前分支
         self._reload_list()
 
     # ------------------------------------------------ 工作区同步(扫描 code)
@@ -1583,7 +1609,7 @@ class App(LogPanelMixin, EnvPanelMixin, ServersMixin, tk.Tk):
         projects.example.json 示例配置。
         """
         dlg = tk.Toplevel(self)
-        dlg.title("欢迎使用 Project Console")
+        dlg.title("欢迎使用 项目管理工具")
         dlg.configure(bg=self._c("card"))
         dlg.transient(self)
         dlg.grab_set()
@@ -1593,7 +1619,7 @@ class App(LogPanelMixin, EnvPanelMixin, ServersMixin, tk.Tk):
         x = self.winfo_x() + (self.winfo_width() - w) // 2
         y = self.winfo_y() + (self.winfo_height() - h) // 2
         dlg.geometry(f"{w}x{h}+{max(0, x)}+{max(0, y)}")
-        tk.Label(dlg, text="👋 欢迎使用 Project Console", bg=self._c("card"), fg=self._c("fg"),
+        tk.Label(dlg, text="👋 欢迎使用 项目管理工具", bg=self._c("card"), fg=self._c("fg"),
                  font=("PingFang SC", 16, "bold")).pack(anchor="w", padx=20, pady=(22, 6))
         tk.Label(dlg, text=("本工具通过 projects.json 管理你的本地项目与远程服务器。\n"
                             "首次使用请选择你的项目根目录 —— 其下每个子目录会被\n"
@@ -1806,16 +1832,19 @@ class App(LogPanelMixin, EnvPanelMixin, ServersMixin, tk.Tk):
             hok, hout = health_ok(loc["health"])
             self.q.put(("lhealth", e["id"], hok, hout))
         # 依赖端口(watch_ports):只刷新显示,不写 status、不进 PID/超时判定,
-        # 否则「停止本项目」会按 PID 杀掉共用的隧道(3307 被 note/wedding 共用)。
+        # 否则「停止本项目」会按 PID 杀掉共用的隧道(多个项目共用同一端口的场景)。
         for p in e.get("watch_ports", []):
             self.q.put(("wport", e["id"], p["port"], port_listening(p["port"])))
         if quiet:
             self.q.put(("list",))
         else:
-            summary = " ".join(f"{p['label']}:{p['port']}={'🟢' if ok else '🔴'}"
-                               for p, ok in results)
-            self.q.put(("log", f"🔍 [{e['name']}] 本地端口检查完成 {summary}",
-                        e["id"]))
+            # 没配端口的条目(目录节点/纯代码仓)不刷这条空检查日志 ——
+            # 之前会带条目 eid 写一条「本地端口检查完成 」,把目录的 tab 也建出来。
+            if results:
+                summary = " ".join(f"{p['label']}:{p['port']}={'🟢' if ok else '🔴'}"
+                                   for p, ok in results)
+                self.q.put(("log", f"🔍 [{e['name']}] 本地端口检查完成 {summary}",
+                            e["id"]))
 
     def _check_server(self, e: dict, quiet: bool = False):
         srv = e["server"]
@@ -1853,6 +1882,9 @@ class App(LogPanelMixin, EnvPanelMixin, ServersMixin, tk.Tk):
                 self.bg(lambda: self._stop_by_pids(e, pids, cmd, loc))
                 return
         self.log(f"▶ [{e['name']}] 本地{verb}: {cmd}", e["id"])
+        nv = resolve_node_version(e)          # node 版本自动选择(引擎/字段/.nvmrc)
+        if nv:
+            self.log(f"🐳 [{e['name']}] 使用 node v{nv}", e["id"])
         if op == "start":
             self.starting[e["id"]] = time.time()   # P0-1:记录启动时刻,超时转红
         else:
@@ -1862,7 +1894,7 @@ class App(LogPanelMixin, EnvPanelMixin, ServersMixin, tk.Tk):
         def job():
             # start 类命令可能触发首次编译(mvn-dev/npm install),给足超时
             code, out = sh(cmd, cwd=cwd, timeout=600 if op == "start" else 120,
-                           node_version=e.get("node_version"))
+                           node_version=nv)
             self.q.put(("log", f"{'✅' if code == 0 else '❌'} [{e['name']}] {verb}完成(退出码 {code})\n{out}",
                         e["id"]))
             if op == "start" and e.get("log_file"):
@@ -1897,7 +1929,7 @@ class App(LogPanelMixin, EnvPanelMixin, ServersMixin, tk.Tk):
             self.q.put(("log", f"⚠️ [{e['name']}] PID 停止后端口 {still} 仍在监听,"
                                f"回退执行 local.stop", e["id"]))
             code, out = sh(fallback_cmd, cwd=e.get("dir"), timeout=120,
-                           node_version=e.get("node_version"))
+                           node_version=resolve_node_version(e))
             self.q.put(("log", f"{'✅' if code == 0 else '❌'} [{e['name']}] stop 兜底完成"
                                f"(退出码 {code})\n{out}", e["id"]))
             time.sleep(1)
@@ -1956,7 +1988,7 @@ class App(LogPanelMixin, EnvPanelMixin, ServersMixin, tk.Tk):
                     self.q.put(("list",))
                     continue
                 code, out = sh(loc["stop"], cwd=e.get("dir"), timeout=120,
-                               node_version=e.get("node_version"))
+                               node_version=resolve_node_version(e))
                 self.starting.pop(e["id"], None)
                 done.append(self.disp(e))
                 if code != 0:
@@ -2040,6 +2072,79 @@ class App(LogPanelMixin, EnvPanelMixin, ServersMixin, tk.Tk):
             dlab.pack(anchor="w", padx=4, pady=(8 if env else 0, 0))
             self._bind_wrap(inner, [dlab], minus=40)
 
+    def _render_note(self, e: dict):
+        """目录备注(repo 分组节点):运行环境下方的一块多行备注。
+
+        只对目录节点(注册表 `kind == "repo"`,即一级分组仓)开放 —— 备注记在
+        目录自己身上,而不是它下面的某个项目。多行输入、输入即存(500ms
+        防抖),切项目 / 切分组 / 关窗时由 `_note_flush` 兜底落盘(与
+        `_env_flush` 互不干扰);内容存条目 `note` 字段,随 projects.json 持久化。
+        """
+        if e.get("kind") != "repo":
+            return
+        eid = e["id"]
+        inner = self._section(self.dinner, "备注")
+        box = tk.Text(inner, height=4, wrap="word",
+                      bg=self._c("log_bg"), fg=self._c("fg"),
+                      insertbackground=self._c("fg"),
+                      relief="flat", bd=0,
+                      highlightthickness=1,
+                      highlightbackground=self._c("line"),
+                      highlightcolor=self._c("accent"),
+                      font=("PingFang SC", 11))
+        box.pack(fill="x", pady=(2, 0))
+        box.insert("1.0", str(e.get("note") or ""))
+        hint = tk.Label(inner, text="输入即自动保存,给这个目录留点说明",
+                        bg=self._c("card"), fg=self._c("mut"),
+                        anchor="w", font=("PingFang SC", 9))
+        hint.pack(anchor="w", pady=(2, 0))
+
+        def cancel_timer():
+            tid = getattr(self, "_note_debounce", None)
+            self._note_debounce = None
+            if tid:
+                try:
+                    self.after_cancel(tid)
+                except tk.TclError:
+                    pass
+
+        def save_note():
+            self._note_debounce = None
+            try:
+                val = box.get("1.0", "end").rstrip("\n")
+            except tk.TclError:      # 控件已销毁(切走后防抖才触发),放弃本次
+                return
+            if str(e.get("note") or "") == val:
+                return               # 没改动就不写盘(切项目时最常见的路径)
+            if val:
+                e["note"] = val
+            else:
+                e.pop("note", None)
+            try:
+                save_config(self.cfg)
+                try:
+                    hint.configure(text="💾 已保存 " + time.strftime("%H:%M:%S"))
+                except tk.TclError:
+                    pass
+            except Exception as ex:  # noqa: BLE001
+                self.log(f"❌ [{self.disp(e)}] 备注保存失败: {ex}", eid)
+                try:
+                    hint.configure(text=f"❌ 保存失败: {ex}")
+                except tk.TclError:
+                    pass
+
+        def debounce_save(_ev=None):
+            cancel_timer()
+            self._note_debounce = self.after(500, save_note)
+
+        def flush_note():
+            cancel_timer()           # 立即落盘:取消挂着的防抖,直接保存一次
+            save_note()
+
+        box.bind("<KeyRelease>", debounce_save, add="+")
+        box.bind("<FocusOut>", lambda _ev: flush_note(), add="+")
+        self._note_flush = flush_note
+
     def act_server(self, e: dict, op: str):
         srv = e["server"]
         verb = {"start": "启动", "restart": "重启", "stop": "停止"}[op]
@@ -2066,7 +2171,8 @@ class App(LogPanelMixin, EnvPanelMixin, ServersMixin, tk.Tk):
         self.log(f"▶ [{e['name']}] {act['label']}: {act['cmd']}", e["id"])
 
         def job():
-            code, out = sh(act["cmd"], cwd=e.get("dir"), node_version=e.get("node_version"))
+            code, out = sh(act["cmd"], cwd=e.get("dir"),
+                           node_version=resolve_node_version(e))
             self.q.put(("log", f"{'✅' if code == 0 else '❌'} [{e['name']}] {act['label']}(退出码 {code})\n{out}",
                         e["id"]))
 
@@ -2252,6 +2358,184 @@ class App(LogPanelMixin, EnvPanelMixin, ServersMixin, tk.Tk):
             self.log(f"❌ [{self.disp(e)}] 备注保存失败: {ex}", e["id"])
         self.select(e["id"])   # 重新渲染头部分支标签
 
+    # ------------------------------------------------ 分支管理(切换/备注/刷新)
+
+    def _local_branches(self, e: dict) -> list[str]:
+        """条目本地分支列表(git branch,按 git 默认排序)。"""
+        d = e.get("dir") or ""
+        if not d:
+            return []
+        code, out = sh(f"git -C {shlex.quote(d)} branch --format='%(refname:short)'",
+                       timeout=10)
+        if code != 0:
+            return []
+        return [b.strip() for b in out.splitlines() if b.strip()]
+
+    def _branch_dialog(self, e: dict, current: str):
+        """分支管理小窗:每个分支一行,行内直接「⇄ 切换」「✎ 备注」。
+
+        不再用「菜单底部再套一个子菜单」的方式备注 —— 分支本身已经是列表,
+        直接在行上操作:当前分支打 ✓,其余点「⇄ 切换」;任何分支都能「✎ 备注」。
+        """
+        dlg = tk.Toplevel(self)
+        dlg.title(f"分支管理 · {self.disp(e)}")
+        dlg.configure(bg=self._c("card"))
+        dlg.transient(self)
+        dlg.grab_set()
+        tk.Label(dlg, text=f"🌿 分支管理 · {self.disp(e)}", bg=self._c("card"),
+                 fg=self._c("fg"), font=("PingFang SC", 14, "bold")).pack(
+                     anchor="w", padx=16, pady=(14, 2))
+        tk.Label(dlg, text="「⇄ 切换」切换分支(有未提交改动会拦截)·「✎ 备注」给分支写说明",
+                 bg=self._c("card"), fg=self._c("mut"),
+                 font=("PingFang SC", 10)).pack(anchor="w", padx=16)
+
+        wrap = tk.Frame(dlg, bg=self._c("card"))
+        wrap.pack(fill="both", expand=True, padx=12, pady=(10, 0))
+        cv = tk.Canvas(wrap, bg=self._c("card"), bd=0, highlightthickness=0)
+        inner = tk.Frame(cv, bg=self._c("card"))
+        win = cv.create_window((0, 0), window=inner, anchor="nw")
+        cv.pack(side="left", fill="both", expand=True)
+        cv.bind("<Configure>", lambda _ev: cv.itemconfigure(win, width=_ev.width))
+        inner.bind("<Configure>", lambda _ev: cv.configure(scrollregion=cv.bbox("all")))
+        cv.bind("<MouseWheel>",
+                lambda ev: cv.yview_scroll(-1 if ev.delta > 0 else 1, "units"))
+        dlg.host = inner
+
+        self._render_branch_rows(dlg, e)
+
+        btnrow = tk.Frame(dlg, bg=self._c("card"))
+        btnrow.pack(fill="x", padx=16, pady=(10, 14))
+        self._ghost_btn(btnrow, "关闭", dlg.destroy, height=26).pack(side="right")
+        dlg.update_idletasks()
+        n = len(self._local_branches(e))
+        need = 52 + n * 34 + 52
+        self._center(dlg, 480, max(220, min(need, 420)))
+        return dlg
+
+    def _render_branch_rows(self, dlg, e: dict):
+        """重建分支行列表:单选式打勾 —— 每行最前面是选中标记,点哪行切到哪个分支。
+
+        列布局:●/○ | 分支名(按最长分支定宽)| 备注(紧随分支名、跨行对齐,
+        吃剩余宽度)| ✎ 备注按钮(贴最右)。备注既不跟在分支名后面、也不靠右对齐。
+        """
+        host = dlg.host
+        for w in host.winfo_children():
+            w.destroy()
+        code, out = sh(f"git -C {shlex.quote(e.get('dir') or '')} "
+                       f"rev-parse --abbrev-ref HEAD 2>&1", timeout=10)
+        cur = out.strip() if code == 0 else ""
+        remarks = e.get("branch_remarks") or {}
+        branches = self._local_branches(e)
+        # 分支名列定宽:按最长分支名实测宽度,保证各行备注列的起点一致
+        name_w = 60
+        if branches:
+            probe = tk.Label(self, font=("Menlo", 12))
+            try:
+                for b in branches:
+                    probe.configure(text=b)
+                    probe.update_idletasks()
+                    name_w = max(name_w, probe.winfo_reqwidth())
+            finally:
+                probe.destroy()
+            name_w += 6
+        for b in branches:
+            row = tk.Frame(host, bg=self._c("card"), cursor="hand2")
+            row.pack(fill="x", pady=1)
+            row.columnconfigure(1, minsize=name_w)   # 分支名定宽 → 备注列起点对齐
+            row.columnconfigure(2, weight=1)         # 备注列吃剩余宽度 → 按钮贴最右
+            is_cur = b == cur
+            rmk = (remarks.get(b) or "").strip()
+            # 列 0:单选标记 ● 当前(accent)/ ○ 未选(muted),点击 = 切换
+            radio = tk.Label(row, text="●" if is_cur else "○",
+                             bg=self._c("card"),
+                             fg=self._c("accent") if is_cur else self._c("mut"),
+                             width=2, anchor="e", cursor="hand2",
+                             font=("Menlo", 12))
+            radio.grid(row=0, column=0, sticky="w", padx=(10, 4))
+            # 列 1:分支名
+            name_lab = tk.Label(row, text=b, bg=self._c("card"),
+                                fg=self._c("fg") if is_cur else self._c("mut"),
+                                anchor="w", cursor="hand2", font=("Menlo", 12))
+            name_lab.grid(row=0, column=1, sticky="w")
+            # 列 2:备注(紧随分支名;所有行同一起点;空则留白)
+            rmk_lab = tk.Label(row, text=rmk, bg=self._c("card"),
+                               fg=self._c("mut"), anchor="w", cursor="hand2",
+                               font=("PingFang SC", 10))
+            rmk_lab.grid(row=0, column=2, sticky="w", padx=(6, 0))
+            # 整行(含单选/分支名/备注区,不含「✎ 备注」按钮)点击 = 切到此分支
+            for w in (row, radio, name_lab, rmk_lab):
+                w.bind("<Button-1>",
+                       lambda _ev, b=b: self._branch_dlg_pick(dlg, e, b))
+            # 列 3:✎ 备注按钮(贴最右,所有行同一列)
+            self._ghost_btn(row, "✎ 备注",
+                            lambda b=b: self._branch_dlg_remark(dlg, e, b),
+                            height=22, font_size=10).grid(
+                            row=0, column=3, sticky="e", padx=(0, 4))
+
+    def _branch_dlg_pick(self, dlg, e, b):
+        """单选打勾:点行即切换;被拦下(未提交改动)则选中态保持。"""
+        if self.switch_branch(e, b):
+            dlg.destroy()   # 切换流程会全量重渲染详情,小窗直接关掉
+
+    def _branch_dlg_remark(self, dlg, e, b):
+        self.edit_branch_remark(e, b)     # 保存 + 重渲染详情(胶囊备注跟着变)
+        self._render_branch_rows(dlg, e)  # 行内备注立即更新
+
+    def switch_branch(self, e: dict, target: str) -> bool:
+        """切换分支:有未提交改动则禁止(用户要求),否则 git checkout 后台执行。
+
+        返回 True 表示已发起切换(成功与否由队列消息决定);False = 被拦下。
+        成功后由 `_handle_msg` 的清空脚本缓存 + 全量重渲染收尾。
+        """
+        d = e.get("dir") or ""
+        if not d or not os.path.isdir(os.path.join(d, ".git")):
+            self.log(f"⚠️ [{self.disp(e)}] 不是 git 仓库,无法切换分支", e["id"])
+            return False
+        code, out = sh(f"git -C {shlex.quote(d)} rev-parse --abbrev-ref HEAD 2>&1",
+                       timeout=10)
+        cur = out.strip() if code == 0 else ""
+        if target == cur:
+            return False
+        # 未提交改动 → 禁止切换(排除 ?? 未跟踪文件:它们切分支会原样带过去,不冲突)
+        code2, out2 = sh(f"git -C {shlex.quote(d)} status --porcelain", timeout=10)
+        dirty = [ln for ln in (out2 or "").splitlines()
+                 if ln.strip() and not ln.startswith("??")]
+        if dirty:
+            head = "\n".join(f"  · {ln.strip()[:70]}" for ln in dirty[:10])
+            if len(dirty) > 10:
+                head += f"\n  · … 等 {len(dirty)} 处"
+            messagebox.showwarning(
+                "无法切换分支",
+                f"「{self.disp(e)}」有 {len(dirty)} 处未提交的修改:\n\n{head}\n\n"
+                f"请先提交或暂存这些改动后再切换到 {target}。")
+            self.log(f"⛔ [{self.disp(e)}] 有未提交改动,禁止切换到 {target}", e["id"])
+            return False
+        self.log(f"⇄ [{self.disp(e)}] 切换到分支 {target} …", e["id"])
+
+        def job():
+            c, o = sh(f"git -C {shlex.quote(d)} checkout {shlex.quote(target)}",
+                      timeout=120)
+            self.q.put(("branch_switched", e["id"], target, c, o))
+
+        self.bg(job)
+        return True
+
+    def _refresh_branch_label(self, e: dict):
+        """「刷新本项目」时重新读当前分支并更新头部胶囊(不动整个详情)。"""
+        lab = (getattr(self, "_branch_labels", {}) or {}).get(e["id"])
+        if lab is None or not e.get("dir"):
+            return
+        code, out = sh(f"git -C {shlex.quote(e['dir'])} rev-parse --abbrev-ref HEAD 2>&1",
+                       timeout=10)
+        branch = out.strip() if code == 0 else ""
+        if not branch:
+            return
+        rmk = (e.get("branch_remarks") or {}).get(branch, "")
+        try:
+            lab.configure(text=f"🌿 {branch}" + (f" — {rmk}" if rmk else ""))
+        except tk.TclError:
+            pass
+
     def refresh_scripts(self, e: dict | None = None):
         """重读选中条目的 package.json(切 Git 分支后 scripts 可能变化)。"""
         e = e or self._entry(self.sel_id)
@@ -2274,6 +2558,9 @@ class App(LogPanelMixin, EnvPanelMixin, ServersMixin, tk.Tk):
             return
         cmd_full = next((c for n, c in scripts if n == name), "")
         disp = self.disp(e)
+        nv = resolve_node_version(e)          # node 版本自动选择(引擎/字段/.nvmrc)
+        if nv:
+            self.log(f"🐳 [{disp}] 使用 node v{nv}", e["id"])
 
         if cmd_full.startswith("npm run"):
             # 长驻 dev server:nohup 后台跑 + 日志文件增量回显
@@ -2287,7 +2574,7 @@ class App(LogPanelMixin, EnvPanelMixin, ServersMixin, tk.Tk):
             self._log_starting_hint(e)
 
             def job():
-                code, out = sh(cmd, timeout=20, node_version=e.get("node_version"))
+                code, out = sh(cmd, timeout=20, node_version=nv)
                 if code != 0:
                     self.q.put(("log", f"❌ [{disp}] 启动脚本失败: {out}", e["id"]))
                 # 运行输出进「这个项目」的 tab(attach 只能在主线程做)
@@ -2306,7 +2593,7 @@ class App(LogPanelMixin, EnvPanelMixin, ServersMixin, tk.Tk):
 
             def job():
                 code, out = sh(cmd_full, cwd=e.get("dir"), timeout=600,
-                               node_version=e.get("node_version"))
+                               node_version=nv)
                 self.q.put(("log", f"{'✅' if code == 0 else '❌'} [{disp}] {name}"
                                    f"(退出码 {code})\n{out}", e["id"]))
                 if e.get("log_file"):
@@ -2477,6 +2764,21 @@ class App(LogPanelMixin, EnvPanelMixin, ServersMixin, tk.Tk):
                                    f"{'通过' if ok else '不通'}",
                               fg=self._c("green") if ok else self._c("red"))
             self._refresh_status_chips(eid)
+        elif kind == "branch_switched":
+            # git checkout 结果:成功则清空脚本缓存 + 全量重渲染(分支标签/
+            # 脚本列表/端口状态一次到位);失败只写日志,分支保持不变。
+            _, eid, target, code, out = msg
+            e = self._entry(eid)
+            if e is None:
+                return
+            if code == 0:
+                self.scripts.pop(eid, None)      # 关键:强制重读 package.json
+                self.log(f"✅ [{self.disp(e)}] 已切换到分支 {target},"
+                         f"脚本已重新加载", eid)
+                self.select(eid)
+            else:
+                self.log(f"❌ [{self.disp(e)}] 切换到 {target} 失败:"
+                         f"{(out or '')[:400]}", eid)
         # ------------------------------------------------ v2.1 发布(每类独立隔离)
         elif kind == "deploy_confirm":
             # 后台发布线程 → 主线程弹确认框,结果回填并唤醒线程。

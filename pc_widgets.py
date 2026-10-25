@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-pc_widgets —— Project Console 自绘控件与绘图辅助
+pc_widgets —— 项目管理工具 自绘控件与绘图辅助
 
 包含:
     _DotList        左栏自绘列表(Canvas 圆点状态灯 + 折叠树)

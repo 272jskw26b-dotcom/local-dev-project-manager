@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-pc_theme —— Project Console 主题层
+pc_theme —— 项目管理工具 主题层
 
 双主题配色字典(玻璃拟态外观语言)与主题偏好持久化路径。
 纯数据模块:不 import tkinter,不依赖其他模块。

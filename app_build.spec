@@ -1,6 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 """
-PyInstaller 打包配置 —— 构建 macOS 桌面应用 Local Dev Project Manager.app
+PyInstaller 打包配置 —— 构建 macOS 桌面应用 项目管理工具.app
 
 用法（在项目根目录执行）：
     .venv-desktop/bin/pyinstaller --noconfirm --clean app_build.spec
@@ -38,7 +38,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='LocalDevProjectManager',
+    name='ProjectManager',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -51,12 +51,12 @@ exe = EXE(
 
 app = BUNDLE(
     exe,
-    name='Local Dev Project Manager.app',
+    name='项目管理工具.app',
     icon='assets/icon.icns',
-    bundle_identifier='com.localdevprojectmanager.app',
+    bundle_identifier='com.projectmanager.app',
     info_plist={
-        'CFBundleName': 'Local Dev Project Manager',
-        'CFBundleDisplayName': 'Local Dev Project Manager',
+        'CFBundleName': '项目管理工具',
+        'CFBundleDisplayName': '项目管理工具',
         'NSHighResolutionCapable': True,
         'LSMinimumSystemVersion': '11.0',
     },

@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================
-#  Local Dev Project Manager —— 构建 + 部署脚本
+#  项目管理工具 —— 构建 + 部署脚本
 #
 #  用法：
 #     ./build.sh          构建并部署到桌面（默认）
@@ -20,8 +20,8 @@ cd "$PROJECT_DIR"
 VENV=".venv-desktop"
 PY="$VENV/bin/python"
 PYINSTALLER="$VENV/bin/pyinstaller"
-APP_NAME="Local Dev Project Manager.app"
-EXE_NAME="LocalDevProjectManager"
+APP_NAME="项目管理工具.app"
+EXE_NAME="ProjectManager"
 DESKTOP="$HOME/Desktop/$APP_NAME"
 # 基础解释器(用于创建 venv):PC_PYTHON 环境变量 > 常见路径逐一探测。
 # 探测标准:能执行且自带 tkinter(本项目 UI 依赖)。

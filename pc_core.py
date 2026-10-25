@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-pc_core —— Project Console 纯逻辑层(零 tkinter 依赖,可无头测试)
+pc_core —— 项目管理工具 纯逻辑层(零 tkinter 依赖,可无头测试)
 
 包含:注册表读写、路径定位、工作区同步扫描、脚本列表、命令执行(sh/端口/
 systemd/健康检查)、PATH 环境补全。UI 相关代码在 project_console.py,
@@ -562,6 +562,11 @@ def build_entry_for_dir(d: str, parent_id: str, taken_ids: set[str]) -> tuple[di
                      if port else "(同步自动识别)Node 项目,dev 端口没探测到,可用脚本列表手动启动。"),
             "dir": d,
         }
+        # 导入即配好 node 版本:优先 .nvmrc,其次 package.json engines.node
+        # 映射到已安装版本 —— 新用户首次导入/同步时就不用再手工填 node_version。
+        nv = resolve_node_version(e)
+        if nv:
+            e["node_version"] = nv
         if port:
             logp = f"/tmp/pc-{eid}-start.log"
             e["local"] = {
@@ -989,6 +994,113 @@ def env_report(e: dict) -> dict[str, str]:
         out["java"] = str(req_j).strip()
 
     return out
+
+
+# ------------------------------------------------ node 版本自动选择
+#
+# 为什么要有这一段:前端项目对 node 版本要求各不相同(新 Vite 要 ≥20,
+# 老 node-sass 要 14/16),启动/打包时用错版本会莫名其妙失败。早先只有
+# 「注册表显式写 node_version 才钉版本」,没写就全部落到 nvm default ——
+# 项目重新扫描/重新导入后 node_version 字段丢了,「自动切换」就消失了。
+# 这里补齐:显式 node_version > .nvmrc > engines.node(映射到已安装版本)
+# > 不钉(走 nvm default)。
+
+
+def _installed_node_versions() -> list[tuple[int, int, int, str]]:
+    """已安装的 nvm node 版本列表,升序:[(major, minor, patch, "20.20.2")]。"""
+    out: list[tuple[int, int, int, str]] = []
+    for d in glob.glob(os.path.expanduser("~/.nvm/versions/node/v*/bin")):
+        base = os.path.basename(os.path.dirname(d))          # v20.20.2
+        m = re.match(r"^v?(\d+)\.(\d+)\.(\d+)$", base)
+        if m:
+            out.append((int(m.group(1)), int(m.group(2)),
+                        int(m.group(3)), base[1:]))
+    out.sort()
+    return out
+
+
+def _match_installed_node(constraint: str) -> str | None:
+    """把 engines.node 的约束串映射到已安装的 node 版本号;匹配不到返回 None。
+
+    - 精确(20 / 20.20 / 20.20.2)→ 已安装里同 major(或同 major.minor)最高的;
+    - ^/~/>=/> → 已安装里**最低**满足约束的版本 —— 老项目(>=8.9 这种远古
+      约束)会落到最老的 14,而不是直接跳到 24(跳新版对老项目 node-sass
+      反而会炸);
+    - <=/< → 已安装里最高满足的。
+    """
+    c = (constraint or "").strip().lower()
+    m = re.match(r"^(>=|>|<=|<|\^|~)?\s*v?(\d+)(?:\.(\d+))?(?:\.(\d+))?$", c)
+    if not m:
+        return None
+    op, ma_s, mi_s, pa_s = m.group(1), m.group(2), m.group(3), m.group(4)
+    ma, mi, pa = int(ma_s), int(mi_s or 0), int(pa_s or 0)
+    vers = _installed_node_versions()
+    if not vers:
+        return None
+    if op in ("^", "~"):
+        if op == "^":   # ^X.Y → 同 major、>= X.Y 的最旧版
+            cands = [s for a, b, p, s in vers
+                     if a == ma and (a, b, p) >= (ma, mi, pa)]
+        else:           # ~X.Y → 同 major.minor、patch >= 的最旧版
+            cands = [s for a, b, p, s in vers
+                     if a == ma and b == mi and p >= pa]
+        return cands[0] if cands else None
+    if op in (">=", ">"):
+        cands = [s for a, b, p, s in vers if (a, b, p) >= (ma, mi, pa)]
+        return cands[0] if cands else None
+    if op in ("<=", "<"):
+        if mi_s is None and pa_s is None:     # 裸 major(<=16)→ 只比 major
+            cands = [s for a, b, p, s in vers if a <= ma]
+        else:
+            cands = [s for a, b, p, s in vers if (a, b, p) <= (ma, mi, pa)]
+        return cands[-1] if cands else None
+    if pa_s is None and mi_s is None:      # 裸 major:同 major 最高
+        cands = [s for a, b, p, s in vers if a == ma]
+        return cands[-1] if cands else None
+    if pa_s is None:                       # major.minor:同 major.minor 最高
+        cands = [s for a, b, p, s in vers if a == ma and b == mi]
+        return cands[-1] if cands else None
+    for a, b, p, s in vers:
+        if (a, b, p) == (ma, mi, pa):
+            return s
+    return None
+
+
+def resolve_node_version(e: dict | None = None) -> str | None:
+    """条目命令实际应使用的 node 版本号(如 "20.20.2");None = 不钉,走 nvm default。
+
+    优先级:
+      1. 注册表显式 `node_version` 字段(填了但没装也原样返回,_path_env 会告警);
+      2. 项目目录 `.nvmrc`(常见前端约定,如 "20.20.2" / "v16");
+      3. package.json `engines.node` 映射到已安装的版本;
+      4. 以上都没有 → None。
+    """
+    e = e or {}
+    v = str(e.get("node_version") or "").strip()
+    if v:
+        return v.lstrip("v")
+    d = str(e.get("dir") or "").strip()
+    if d:
+        nvmrc = os.path.join(d, ".nvmrc")
+        if os.path.isfile(nvmrc):
+            try:
+                v = open(nvmrc, encoding="utf-8").read().strip()
+            except OSError:
+                v = ""
+            if v and not v.lower().startswith(("lts", "node", "latest")):
+                v = v.lstrip("v")
+                if os.path.isdir(os.path.expanduser(f"~/.nvm/versions/node/v{v}/bin")):
+                    return v                    # 精确命中
+                got = _match_installed_node(v)
+                if got:
+                    return got                  # 裸 major/minor → 已安装最高
+                return v                        # 完全匹配不到:原样返回
+        req = detect_node_require(d)
+        if req:
+            got = _match_installed_node(req)
+            if got:
+                return got
+    return None
 
 
 # ============================================================================
@@ -2070,7 +2182,7 @@ def deploy_static(entry: dict, script: str, items: list[dict], *,
         _log(f"⏭ 跳过构建(skip_build),直接用现有 {local_dir}")
     else:
         ok, err = deploy_build(local_dir, script,
-                               node_version=entry.get("node_version"),
+                               node_version=resolve_node_version(entry),
                                timeout=build_timeout, log=_log,
                                build_cmd=build_cmd)
         if not ok:

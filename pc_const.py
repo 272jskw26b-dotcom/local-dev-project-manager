@@ -9,7 +9,7 @@ pc_const —— 全局常量(纯数据,不 import 任何本项目模块)
 """
 
 # ---------------------------------------------------------------- 常量
-APP_TITLE = "Local Dev Project Manager · 项目控制台"
+APP_TITLE = "项目管理工具"
 
 DOT = {"on": "●", "off": "○", "warn": "◐"}
 AUTO_REFRESH_MS = 15000   # 本地端口自动轮询周期
@@ -24,7 +24,7 @@ BUILD_PREFIX = "build"
 # v2.2 日志 tab 化:系统 tab 固定存在且不可关闭,其余每个项目一个 tab
 SYSTEM_TAB = "system"
 LOG_MAX_LINES = 4000      # 单个 tab 最多保留行数(长跑项目不能把内存吃满)
-LOG_TITLE_MAX = 20        # tab 标题最长字符数(太短会让 ai-platform-api/web 撞名)
+LOG_TITLE_MAX = 20        # tab 标题最长字符数(太短会让同名项目 tab 撞名)
 
 # 服务器认证方式标记。密码本体在内存 cfg 里,落盘时由 save_config() 抽到
 # 同目录 secrets.json(v3.0);auth="key" 表示用户显式选「密钥」压过密码。
