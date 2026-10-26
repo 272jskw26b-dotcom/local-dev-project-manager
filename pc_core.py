@@ -473,21 +473,74 @@ def _unique_id(base: str, taken: set[str]) -> str:
     return nid
 
 
+def _maven_conf_files(d: str) -> dict[str, str]:
+    """收集 (单模块/多模块) resources 下的 application* 配置,返回 {文件名: 路径}。
+
+    多模块工程根目录没有 src/main/resources,配置在子模块里(RuoYi 这类
+    web/system/... 布局),这里把根 + 一/二级子模块的 resources 都扫到,
+    且允许藏在 resources/config/ 这种子目录里,跳过 target 构建产物。
+    """
+    import glob as _glob
+    roots = [os.path.join(d, "src", "main", "resources")]
+    for pat in (os.path.join(d, "*", "src", "main", "resources"),
+                os.path.join(d, "*", "*", "src", "main", "resources")):
+        roots.extend(sorted(_glob.glob(pat)))
+    conf: dict[str, str] = {}
+    for res in roots:
+        if not os.path.isdir(res):
+            continue
+        for dirpath, dirnames, filenames in os.walk(res):
+            dirnames[:] = [x for x in dirnames if x != "target"]
+            for fn in filenames:
+                if fn.startswith("application") and fn.endswith((".yml", ".yaml", ".properties")):
+                    conf.setdefault(fn, os.path.join(dirpath, fn))
+    return conf
+
+
+def _read_port_from_conf(p: str) -> int | None:
+    """从单个 application 配置里读端口(yml 取第一个 port:,properties 取 server.port)。"""
+    try:
+        text = open(p, encoding="utf-8", errors="ignore").read()
+    except OSError:
+        return None
+    m = (re.search(r"(?m)^\s*port:\s*['\"]?(\d{4,5})", text)
+         or re.search(r"(?m)^server\.port\s*=\s*(\d{4,5})", text))
+    return int(m.group(1)) if m else None
+
+
 def _guess_maven_port(d: str) -> int:
-    """在 src/main/resources 下的 application*.yml/properties 里找 server.port,兜底 8080。"""
-    res = os.path.join(d, "src", "main", "resources")
-    for dirpath, dirnames, filenames in os.walk(res):
-        for fn in filenames:
-            if not (fn.startswith("application") and fn.endswith((".yml", ".yaml", ".properties"))):
-                continue
-            try:
-                text = open(os.path.join(dirpath, fn), encoding="utf-8", errors="ignore").read()
-            except OSError:
-                continue
-            m = (re.search(r"(?m)^\s*port:\s*['\"]?(\d{4,5})", text)
-                 or re.search(r"(?m)^server\.port\s*=\s*(\d{4,5})", text))
-            if m:
-                return int(m.group(1))
+    """找 Spring Boot 的 server.port:优先激活 profile 的配置,再看基础配置,兜底 8080。
+
+    端口常写在 application-{profile}.yml 里(基础 application.yml 只声明
+    spring.profiles.active),所以先解析激活的 profile 列表,按「后声明覆盖
+    先声明」的 Spring 规则倒序取端口。
+    """
+    conf = _maven_conf_files(d)
+    if not conf:
+        return 8080
+    base = next((p for k, p in conf.items()
+                 if re.fullmatch(r"application\.(yml|yaml|properties)", k)), None)
+    profiles: list[str] = []
+    if base:
+        try:
+            text = open(base, encoding="utf-8", errors="ignore").read()
+        except OSError:
+            text = ""
+        m = (re.search(r"(?m)^\s*active:\s*['\"]?([\w,-]+(?:\s*,\s*[\w,-]+)*)", text)
+             or re.search(r"(?m)^spring\.profiles\.active\s*=\s*([\w,-]+(?:\s*,\s*[\w,-]+)*)", text))
+        if m:
+            profiles = [x.strip() for x in m.group(1).split(",") if x.strip()]
+    for prof in reversed(profiles):                 # 后激活的 profile 优先级高
+        for k, p in conf.items():
+            if k.startswith(f"application-{prof}."):
+                port = _read_port_from_conf(p)
+                if port:
+                    return port
+    if base and (port := _read_port_from_conf(base)):
+        return port
+    for p in conf.values():                         # 没声明 profile:任一配置里有端口就用
+        if port := _read_port_from_conf(p):
+            return port
     return 8080
 
 

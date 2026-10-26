@@ -65,8 +65,33 @@ ensure_venv() {
     fi
 }
 
+# 便携版 python 的 _tkinter 没把 tcl 库路径编译进去,PyInstaller 的 tkinter
+# hook 拿不到 TCL_LIBRARY 时会把整个 tkinter 判成"损坏"排除,打出来的 app
+# 一启动就 ModuleNotFoundError: tkinter。这里从基础解释器的 lib 目录自动
+# 探测 tcl/tk 给构建进程补上环境变量(venv python 能 import tkinter 不够,
+# hook 判定要看这两个变量)。
+export_tcl_tk() {
+    local libdir tcl tk d
+    libdir="$("$PY" -c 'import sysconfig,os;print(os.path.dirname(sysconfig.get_paths()["stdlib"]))' 2>/dev/null || true)"
+    if [ -z "$libdir" ] || [ ! -d "$libdir" ]; then return 0; fi
+    # 循环探测而非 ls 通配(set -e 下 ls 撞到未匹配的字面量路径会非零退出,
+    # 整个脚本被静默掐死);优先 9.x 再 8.x,取第一个命中的目录。
+    for d in "$libdir"/tcl9.* "$libdir"/tcl8.*; do
+        if [ -z "$tcl" ] && [ -d "$d" ]; then tcl="$d"; fi
+    done
+    for d in "$libdir"/tk9.* "$libdir"/tk8.*; do
+        if [ -z "$tk" ] && [ -d "$d" ]; then tk="$d"; fi
+    done
+    if [ -n "$tcl" ]; then
+        export TCL_LIBRARY="$tcl"
+        export TK_LIBRARY="$tk"
+        c_ok "构建环境 tcl/tk: TCL_LIBRARY=$tcl TK_LIBRARY=${tk:-无}"
+    fi
+}
+
 do_build() {
     local spec="app_build.spec"
+    export_tcl_tk
     if [ "${1:-}" = "debug" ]; then
         # 调试版：console=True，启动失败时能看到 traceback
         c_warn "构建调试版（带终端窗口）…"
@@ -94,6 +119,10 @@ do_deploy() {
     sleep 1
     rm -rf "$DESKTOP"
     cp -R "dist/$APP_NAME" "$DESKTOP"
+    # 清掉 cp 落到 ~/Desktop 时系统加的 com.apple.macl/provenance 扩展属性:
+    # 不清的话 onefile 启动时解压到 /var/folders 的 libpython 会被 macOS 拦截
+    # 删除,报 "Failed to load Python shared library ... (no such file)" 直接闪退。
+    xattr -cr "$DESKTOP" 2>/dev/null || true
     codesign -v "$DESKTOP" 2>/dev/null && c_ok "签名校验通过" \
              || c_warn "签名校验未通过（adhoc 签名通常可正常运行）"
     c_ok "已部署到：$DESKTOP"
